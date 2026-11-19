@@ -234,8 +234,13 @@ func (r *websocketReader) Read(p []byte) (int, error) {
 
 		// Get some data from the underlying reader.
 		n, err := r.r.Read(p)
-		if err != nil {
+		if n == 0 && err != nil {
 			return 0, err
+		}
+		// A Read may return data together with an error. Process the data
+		// first and report the error after it has been handed to the caller.
+		if err != nil {
+			r.closeErr = err
 		}
 		buf = p[:n]
 	}

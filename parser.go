@@ -410,11 +410,22 @@ func (nc *Conn) parse(buf []byte) error {
 			nc.ps.msgBuf = append(nc.ps.msgBuf, (buf[nc.ps.as:])...)
 		}
 	}
-
 	return nil
 
 parseErr:
 	return fmt.Errorf("nats: Parse Error [%d]: '%s'", nc.ps.state, buf[i:])
+}
+
+// processCompleteMsg delivers a message whose payload has been fully received
+// but whose trailing frame terminator has not been parsed yet. This is used
+// when the connection fails so that such an in-flight message is not dropped.
+func (nc *Conn) processCompleteMsg() {
+	ps := nc.ps
+	if ps == nil || ps.state != MSG_PAYLOAD || ps.msgBuf == nil || len(ps.msgBuf) < ps.ma.size {
+		return
+	}
+	nc.processMsg(ps.msgBuf)
+	ps.argBuf, ps.msgBuf, ps.msgCopied, ps.state = nil, nil, false, MSG_END
 }
 
 // cloneMsgArg is used when the split buffer scenario has the pubArg in the existing read buffer, but

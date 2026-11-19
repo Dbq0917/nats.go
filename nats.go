@@ -3925,17 +3925,24 @@ func (nc *Conn) readLoop() {
 
 	for {
 		buf, err := br.Read()
-		if err == nil {
+		// A Read can return data together with an error. That data was
+		// received before the connection failed, so process it before
+		// handling the error and possibly reconnecting.
+		if len(buf) > 0 {
+			if perr := nc.parse(buf); perr != nil {
+				err = perr
+			}
+		} else if err == nil {
 			// With websocket, it is possible that there is no error but
 			// also no buffer returned (either WS control message or read of a
 			// partial compressed message). We could call parse(buf) which
 			// would ignore an empty buffer, but simply go back to top of the loop.
-			if len(buf) == 0 {
-				continue
-			}
-			err = nc.parse(buf)
+			continue
 		}
 		if err != nil {
+			// Deliver a message whose payload was fully received before the
+			// connection failed, even if its frame terminator was not read.
+			nc.processCompleteMsg()
 			// Report the write error rather than the read error it caused.
 			nc.mu.Lock()
 			if nc.bw.partialWriteErr != nil {

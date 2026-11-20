@@ -649,6 +649,146 @@ func TestAsyncErrHandlerChanSubscription(t *testing.T) {
 	})
 }
 
+// TestSlowCallbackDoesNotBlockOtherSubscriptions verifies that a slow
+// message handler on one subscription does not stall delivery to other
+// subscriptions on the same connection. Dispatch is per-subscription: each
+// async subscription has its own delivery goroutine, so a handler blocked on
+// a slow operation (for instance a database write) must not back up the
+// connection's read path or other subscriptions.
+func TestSlowCallbackDoesNotBlockOtherSubscriptions(t *testing.T) {
+	withServer(t, func(t *testing.T, nc *nats.Conn) {
+		release := make(chan struct{})
+		slowRunning := make(chan bool, 1)
+		fastMsgs := make(chan *nats.Msg, 64)
+
+		// The slow handler parks on the first message and stays parked
+		// until the end of the test, simulating a long blocking operation.
+		slowSub, err := nc.Subscribe("slow", func(_ *nats.Msg) {
+			slowRunning <- true
+			<-release
+		})
+		if err != nil {
+			t.Fatalf("Failed to create slow subscription: %v", err)
+		}
+		defer slowSub.Unsubscribe()
+
+		fastSub, err := nc.Subscribe("fast", func(m *nats.Msg) {
+			fastMsgs <- m
+		})
+		if err != nil {
+			t.Fatalf("Failed to create fast subscription: %v", err)
+		}
+		defer fastSub.Unsubscribe()
+
+		// Park the slow subscription's handler and make sure it is actually
+		// inside the callback before publishing anything else.
+		if err := nc.Publish("slow", []byte("park")); err != nil {
+			t.Fatalf("Publish failed: %v", err)
+		}
+		if e := Wait(slowRunning); e != nil {
+			t.Fatal("Slow callback never started")
+		}
+
+		// Flood the slow subject past its pending limits so that without
+		// per-subscription dispatch the connection would be considered a
+		// slow consumer and eventually closed.
+		for range nats.DefaultSubPendingMsgsLimit + 100 {
+			if err := nc.Publish("slow", []byte("backlog")); err != nil {
+				t.Fatalf("Publish failed: %v", err)
+			}
+		}
+		if err := nc.FlushTimeout(5 * time.Second); err != nil {
+			t.Fatalf("Flush failed: %v", err)
+		}
+
+		// The other subscription on the same connection must keep receiving
+		// promptly while the slow handler is still blocked and its own
+		// pending queue is full. Measure the wait for each fast message
+		// independently so the publish/flush time is not counted as latency.
+		const fastCount = 25
+		var maxLatency time.Duration
+		for i := range fastCount {
+			if err := nc.Publish("fast", []byte(fmt.Sprintf("msg-%d", i))); err != nil {
+				t.Fatalf("Publish failed: %v", err)
+			}
+			start := time.Now()
+			select {
+			case m := <-fastMsgs:
+				if latency := time.Since(start); latency > maxLatency {
+					maxLatency = latency
+				}
+				if want := fmt.Sprintf("msg-%d", i); string(m.Data) != want {
+					t.Fatalf("Wrong message at position %d: expected %q, got %q", i, want, m.Data)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("Fast subscription stalled after %d/%d messages because of the slow callback", i, fastCount)
+			}
+		}
+		t.Logf("Fast subscription max per-message latency was %v while the slow callback was blocked", maxLatency)
+
+		if !nc.IsConnected() {
+			t.Fatal("Connection was closed while a subscription had a slow callback")
+		}
+
+		close(release)
+	})
+}
+
+// TestSlowCallbackPreservesSubscriptionOrdering verifies the other half of
+// the dispatch contract: decoupling callbacks across subscriptions must not
+// allow messages of a single subscription to be processed concurrently or
+// out of order. Even when a handler is slow, messages on that subscription
+// are still delivered one at a time, in arrival order.
+func TestSlowCallbackPreservesSubscriptionOrdering(t *testing.T) {
+	withServer(t, func(t *testing.T, nc *nats.Conn) {
+		const total = 50
+		received := make(chan int, total)
+
+		var inCallback atomic.Bool
+		sub, err := nc.Subscribe("ordered", func(m *nats.Msg) {
+			if !inCallback.CompareAndSwap(false, true) {
+				t.Error("Subscription callback invoked concurrently")
+			}
+			defer inCallback.Store(false)
+
+			var seq int
+			if _, err := fmt.Sscanf(string(m.Data), "msg-%d", &seq); err != nil {
+				t.Errorf("Bad message payload %q: %v", m.Data, err)
+				return
+			}
+			// Simulate work so that, without strict per-subscription
+			// serial delivery, later messages could overtake earlier ones.
+			time.Sleep(2 * time.Millisecond)
+			received <- seq
+		})
+		if err != nil {
+			t.Fatalf("Failed to subscribe: %v", err)
+		}
+		defer sub.Unsubscribe()
+
+		for i := range total {
+			if err := nc.Publish("ordered", []byte(fmt.Sprintf("msg-%d", i))); err != nil {
+				t.Fatalf("Publish failed: %v", err)
+			}
+		}
+		if err := nc.FlushTimeout(5 * time.Second); err != nil {
+			t.Fatalf("Flush failed: %v", err)
+		}
+
+		deadline := time.After(10 * time.Second)
+		for want := range total {
+			select {
+			case got := <-received:
+				if got != want {
+					t.Fatalf("Messages delivered out of order: expected %d, got %d", want, got)
+				}
+			case <-deadline:
+				t.Fatalf("Timed out waiting for message %d", want)
+			}
+		}
+	})
+}
+
 // Test to make sure that we can send and async receive messages on
 // different subjects within a callback.
 func TestAsyncSubscriberStarvation(t *testing.T) {
